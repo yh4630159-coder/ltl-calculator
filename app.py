@@ -3,8 +3,7 @@ import pandas as pd
 import os
 import io
 
-# ================= 1. 核心配置 (V4.7 - 极速内核版) =================
-# 定义仓库主数据
+# ================= 1. 核心配置 (V4.8 ) =================
 WAREHOUSE_DB = [
     {"name": "AI美西001 (Ontario)", "zip": "91761", "zone_code": "CA"},
     {"name": "AI美西002 (Ontario)", "zip": "91761", "zone_code": "CA"},
@@ -32,28 +31,20 @@ CONFIG = {
     'OVERSIZE_FEE': 50,
 }
 
-# ================= 2. 数据加载 (极速优化) =================
+# ================= 2. 数据加载 =================
 @st.cache_data
 def load_data_optimized():
     if not os.path.exists(CONFIG['FILE_NAME']):
         return None, None, None, f"找不到文件 '{CONFIG['FILE_NAME']}'"
 
     try:
-        # 读取 Excel
         df_zone = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='分区', engine='openpyxl')
         df_rates_raw = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='基础运费', header=None, engine='openpyxl')
         df_remote = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='偏远邮编', engine='openpyxl')
         
-        # --- 🚀 提速优化 1: 构建分区字典 (Lookup Dictionary) ---
-        # 将 DataFrame 转换为字典: key=(州代码, 仓库分区列名), value=分区代码
-        # 这样以后查询就不需要 filter dataframe 了，速度提升 100倍
         zone_dict = {}
-        # 预先处理好需要的列
         needed_cols = ['state', 'CA发货分区', 'NJ发货分区', 'SAV发货分区', 'HOU发货分区']
-        # 检查列是否存在
         valid_cols = [c for c in needed_cols if c in df_zone.columns]
-        
-        # 遍历每一行构建索引
         for _, row in df_zone[valid_cols].iterrows():
             state = str(row['state']).strip().upper()
             if 'CA发货分区' in valid_cols: zone_dict[(state, 'CA')] = row['CA发货分区']
@@ -61,8 +52,6 @@ def load_data_optimized():
             if 'SAV发货分区' in valid_cols: zone_dict[(state, 'SAV')] = row['SAV发货分区']
             if 'HOU发货分区' in valid_cols: zone_dict[(state, 'HOU')] = row['HOU发货分区']
 
-        # --- 🚀 提速优化 2: 构建费率字典 ---
-        # 清洗费率表
         header_idx = 0
         for r in range(20): 
             row_values = df_rates_raw.iloc[r].fillna('').astype(str).values
@@ -73,39 +62,28 @@ def load_data_optimized():
         rates_df.columns = ['Zone', 'Min_West', 'Rate_West_Low', 'Rate_West_High', 'Min_NonWest', 'Rate_NonWest_Low', 'Rate_NonWest_High']
         rates_df = rates_df.dropna(subset=['Zone'])
         rates_df = rates_df[rates_df['Zone'].isin(['A','B','C','D','E','F'])]
-        
-        # 转为字典: key=Zone, value={各项费率}
         rate_dict = rates_df.set_index('Zone').to_dict('index')
 
-        # --- 🚀 提速优化 3: 偏远邮编 Set ---
         remote_zips = set(df_remote.iloc[:, 0].astype(str).str.replace('.0', '', regex=False).str.strip().tolist())
-        
         return zone_dict, rate_dict, remote_zips, None
     except Exception as e:
         return None, None, None, f"数据读取错误: {str(e)}"
 
-# ================= 3. 核心计算逻辑 (纯内存运算) =================
+# ================= 3. 核心计算逻辑 =================
 def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
-    if shipment_data.empty: return None, "无数据"
+    if shipment_data.empty: return None, "无有效包裹数据"
     
-    # 1. 基础信息
     first_item = shipment_data.iloc[0]
     o_zip = str(first_item['发货邮编']).replace('.0', '').strip()
     d_zip = str(first_item['收货邮编']).replace('.0', '').strip()
     d_state = str(first_item['收货州']).upper().strip()
     
-    # 2. 匹配分区 (O(1) 字典查找)
     warehouse_zone_code = ZIP_TO_ZONE_MAP.get(o_zip)
-    if not warehouse_zone_code:
-        return None, f"发货邮编 {o_zip} 无效"
+    if not warehouse_zone_code: return None, f"发货邮编 {o_zip} 无效"
 
-    # 直接查字典，不再操作 DataFrame
     zone = zone_dict.get((d_state, warehouse_zone_code))
-    if not zone:
-        return None, f"不支持发往 {d_state}"
+    if not zone: return None, f"不支持发往 {d_state}"
 
-    # 3. 聚合计算
-    # 使用 numpy 向量化计算会更快，但为了代码可读性，这里用原生循环也足够快
     total_actual_weight = 0
     total_dim_weight = 0
     is_oversize = False
@@ -117,10 +95,8 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
         if weight > 250 or (weight > 150 and max(l,w,h) > 72):
             is_oversize = True
 
-    # 4. 费用计算
     billable = max(total_actual_weight, total_dim_weight, CONFIG['MIN_BILLABLE_WEIGHT'])
 
-    # 费率匹配 (O(1) 字典查找)
     is_west = (warehouse_zone_code == 'CA')
     r_data = rate_dict.get(zone)
     if not r_data: return None, f"缺 {zone} 区费率"
@@ -135,7 +111,6 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
     base = max(billable * rate, min_c)
     fuel = base * CONFIG['FUEL_RATE']
     
-    # 偏远费 (Set 查找也是 O(1))
     is_remote = d_zip in remote_zips
     remote = (billable / 100) * CONFIG['REMOTE_RATE'] if is_remote else 0
     oversize = CONFIG['OVERSIZE_FEE'] if is_oversize else 0
@@ -152,10 +127,10 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
     }, None
 
 # ================= 4. 界面逻辑 =================
-st.set_page_config(page_title="LTL 运费计算器 V4.7", page_icon="⚡", layout="wide")
-st.title("⚡ 马士基 LTL 运费计算器 (极速版)")
+st.set_page_config(page_title="LTL 运费计算器 V4.8", page_icon="🚚", layout="wide")
+st.title("🚚 马士基 LTL 运费计算器")
+st.caption("逻辑版本: V4.8 ")
 
-# 加载优化后的数据结构
 zone_dict, rate_dict, remote_zips, err_msg = load_data_optimized()
 
 if err_msg:
@@ -165,7 +140,7 @@ else:
 
     # --- TAB 1: 交互式 ---
     with tab1:
-        st.info("👇 智能选仓 + 极速计算")
+        st.info("💡 操作提示：如果多加了一行，直接在【删除】列打勾，计算时会自动忽略。")
         
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -175,27 +150,44 @@ else:
         with c3: d_state = st.text_input("收货州代码", "MI")
 
         st.markdown("###### 📦 包裹明细")
-        default_data = pd.DataFrame([{"长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0}])
+        
+        # 🌟 核心修改 1: 默认数据增加 '删除' 列
+        default_data = pd.DataFrame([
+            {"长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0, "删除": False}
+        ])
+        
+        # 🌟 核心修改 2: 配置 Checkbox 列
         edited_df = st.data_editor(
-            default_data, num_rows="dynamic",
+            default_data, 
+            num_rows="dynamic",
             column_config={
                 "长": st.column_config.NumberColumn("长 (in)", required=True),
                 "宽": st.column_config.NumberColumn("宽 (in)", required=True),
                 "高": st.column_config.NumberColumn("高 (in)", required=True),
                 "实重": st.column_config.NumberColumn("实重 (lbs)", required=True),
-            }, use_container_width=True
+                "删除": st.column_config.CheckboxColumn("删除?", help="勾选后，该包裹将不参与计算", default=False)
+            }, 
+            use_container_width=True
         )
 
         if st.button("🚀 立即计算", type="primary", use_container_width=True):
-            if not (d_zip and d_state and not edited_df.empty):
-                st.warning("⚠️ 请完善信息")
+            # 🌟 核心修改 3: 过滤掉打勾的行
+            valid_rows = edited_df[~edited_df['删除']].copy()
+            deleted_count = len(edited_df) - len(valid_rows)
+
+            if not (d_zip and d_state):
+                st.warning("⚠️ 请完善收货地址信息")
+            elif valid_rows.empty:
+                st.warning("⚠️ 请至少保留一个有效包裹（未勾选删除）！")
             else:
-                calc_data = edited_df.copy()
+                if deleted_count > 0:
+                    st.toast(f"🗑️ 已自动忽略 {deleted_count} 个标记删除的包裹")
+
+                calc_data = valid_rows.copy()
                 calc_data['发货邮编'] = o_zip_val
                 calc_data['收货邮编'] = d_zip
                 calc_data['收货州'] = d_state
                 
-                # 调用极速算法
                 res, err = calculate_shipment_fast(zone_dict, rate_dict, remote_zips, calc_data)
                 
                 if err: st.error(err)
@@ -204,17 +196,16 @@ else:
                     c_a, c_b, c_c = st.columns(3)
                     with c_a: st.metric("💰 预估总运费", f"${res['总费用']}")
                     with c_b: st.metric("⚖️ 最终计费重", f"{res['计费重']} lbs")
-                    with c_c: st.metric("📍 分区", f"{res['分区']}区")
+                    with c_c: st.metric("📦 有效包裹", f"{res['包裹数']} 件")
                     
                     st.table(pd.DataFrame({
                         "费用项": ["基础运费", "燃油费", "偏远费", "超尺费"],
                         "金额": [res['基础运费'], res['燃油费'], res['偏远费'], res['超尺费']]
                     }).T)
 
-    # --- TAB 2: 批量上传 ---
+    # --- TAB 2: 批量上传 (保持不变) ---
     with tab2:
         st.markdown("### 📥 批量极速计算")
-        
         with st.expander("查看仓库对照表"):
             st.dataframe(pd.DataFrame(WAREHOUSE_DB)[['name','zip']], hide_index=True)
 
@@ -226,24 +217,17 @@ else:
         
         st.divider()
         uploaded_file = st.file_uploader("上传 Excel", type=['xlsx'])
-        
         if uploaded_file:
             try:
                 df_input = pd.read_excel(uploaded_file, engine='openpyxl')
                 required = ["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"]
-                
                 if not all(c in df_input.columns for c in required):
                     st.error("❌ 格式错误")
                 else:
                     grouped = df_input.groupby('订单号')
                     results = []
-                    
-                    # 进度条
                     bar = st.progress(0)
-                    total_groups = len(grouped)
-                    
                     for i, (order_id, group_df) in enumerate(grouped):
-                        # 调用极速算法
                         res, err = calculate_shipment_fast(zone_dict, rate_dict, remote_zips, group_df)
                         row_res = {'订单号': order_id}
                         if err:
@@ -253,11 +237,10 @@ else:
                             row_res['状态'] = '成功'
                             row_res.update(res)
                         results.append(row_res)
-                        bar.progress((i + 1) / total_groups)
+                        bar.progress((i + 1) / len(grouped))
                     
                     res_df = pd.DataFrame(results)
                     st.success(f"🎉 {len(res_df)} 个订单计算完成！")
-                    
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         res_df.to_excel(writer, index=False)
