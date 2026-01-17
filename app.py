@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import io
 
-# ================= 1. 核心配置 (V4.4 - 一票多件版) =================
+# ================= 1. 核心配置 (V4.5 - 交互式多包裹版) =================
 CONFIG = {
     'FILE_NAME': 'data.xlsx',
     'DIM_FACTOR': 200,
@@ -48,12 +48,15 @@ def load_data():
     except Exception as e:
         return None, None, None, f"数据读取错误: {str(e)}"
 
-# ================= 3. 核心计算逻辑 (支持合并) =================
+# ================= 3. 核心计算逻辑 (通用) =================
 def calculate_shipment(df_zone, df_rates, remote_zips, shipment_data):
     """
     shipment_data: 一个包含该订单所有包裹信息的 DataFrame
+    必须包含列: '长', '宽', '高', '实重', 以及发收地址信息(取第一行)
     """
-    # 1. 提取基础信息 (取第一行数据，假设同一订单发收地址一致)
+    # 1. 提取基础信息 (取第一行数据)
+    if shipment_data.empty: return None, "没有包裹数据"
+    
     first_item = shipment_data.iloc[0]
     o_zip = str(first_item['发货邮编']).replace('.0', '').strip()
     d_zip = str(first_item['收货邮编']).replace('.0', '').strip()
@@ -71,15 +74,13 @@ def calculate_shipment(df_zone, df_rates, remote_zips, shipment_data):
     
     zone = zone_row[col_name].values[0]
 
-    # 3. 聚合计算重量与尺寸 (V4.4 核心升级)
+    # 3. 聚合计算重量与尺寸
     total_actual_weight = 0
     total_dim_weight = 0
     is_oversize = False
     
-    package_details = [] # 用于记录每件包裹的详情
-
     for _, row in shipment_data.iterrows():
-        l, w, h, weight = row['长'], row['宽'], row['高'], row['实重']
+        l, w, h, weight = float(row['长']), float(row['宽']), float(row['高']), float(row['实重'])
         
         # 累加实重
         total_actual_weight += weight
@@ -88,16 +89,13 @@ def calculate_shipment(df_zone, df_rates, remote_zips, shipment_data):
         dim_w = (l * w * h) / CONFIG['DIM_FACTOR']
         total_dim_weight += dim_w
         
-        # 检查单件超尺 (只要有一件超，整票就超)
-        # 规则: 实重>250 OR (实重>150 AND 任意边>72)
+        # 检查单件超尺
         if weight > 250:
             is_oversize = True
         elif (weight > 150) and (max(l, w, h) > 72):
             is_oversize = True
-            
-        package_details.append(f"{l}x{w}x{h}/{weight}lbs")
 
-    # 4. 计算最终计费重 (一票只收一个起步价)
+    # 4. 计算最终计费重
     billable = max(total_actual_weight, total_dim_weight, CONFIG['MIN_BILLABLE_WEIGHT'])
 
     # 5. 费率匹配
@@ -135,60 +133,96 @@ def calculate_shipment(df_zone, df_rates, remote_zips, shipment_data):
     }, None
 
 # ================= 4. 界面逻辑 =================
-st.set_page_config(page_title="LTL 运费计算器 V4.4", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="LTL 运费计算器 V4.5", page_icon="🚚", layout="wide")
 st.title("🚚 马士基 LTL 运费计算器")
-st.caption("逻辑版本: V4.4 (支持一票多件合并计算)")
+st.caption("逻辑版本: V4.5 (支持动态添加多包裹)")
 
 df_zone, df_rates, remote_zips, err_msg = load_data()
 
 if err_msg:
     st.error(f"❌ 系统错误: {err_msg}")
 else:
-    tab1, tab2 = st.tabs(["🧮 单票计算 (快速)", "📥 批量计算 (含多件合并)"])
+    tab1, tab2 = st.tabs(["🧮 交互式计算 (单票多件)", "📥 批量上传 (Excel)"])
 
-    # --- TAB 1: 单票计算 (保持简便) ---
+    # --- TAB 1: 交互式计算 (重大升级) ---
     with tab1:
-        st.info("💡 提示：单票计算仅支持单个包裹。如果是多件货物，请使用“批量计算”功能。")
-        with st.form("calc_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                o_zip = st.text_input("发货邮编", "08820")
-                d_zip = st.text_input("收货邮编", "49022")
-                d_state = st.text_input("收货州代码", "MI")
-            with col2:
-                c1, c2, c3 = st.columns(3)
-                with c1: L = st.number_input("长 (in)", value=80.0)
-                with c2: W = st.number_input("宽 (in)", value=32.2)
-                with c3: H = st.number_input("高 (in)", value=24.6)
-                weight = st.number_input("实重 (lbs)", value=141.0)
-            submitted = st.form_submit_button("计算")
-            
-            if submitted:
-                # 构造单行数据模拟 DataFrame
-                mock_df = pd.DataFrame([{
-                    '发货邮编': o_zip, '收货邮编': d_zip, '收货州': d_state,
-                    '长': L, '宽': W, '高': H, '实重': weight
-                }])
-                res, err = calculate_shipment(df_zone, df_rates, remote_zips, mock_df)
-                if err: st.error(err)
-                else:
-                    st.success(f"### 总费用: ${res['总费用']}")
-                    st.table(pd.DataFrame({k:[v] for k,v in res.items() if k not in ['包裹数','总实重','总体积重']}))
-
-    # --- TAB 2: 批量计算 (核心升级) ---
-    with tab2:
-        st.markdown("### 1. 下载 V4.4 新版模板")
-        st.markdown("**⚠️ 注意：必须填写【订单号】列。订单号相同的行，会自动合并为一票计算。**")
+        st.info("👇 在下方表格中输入包裹信息，支持添加多行。系统会自动合并计算。")
         
-        # 模板包含订单号
+        # A. 地址信息区 (公用)
+        col_addr1, col_addr2, col_addr3 = st.columns(3)
+        with col_addr1: o_zip = st.text_input("发货邮编", "08820")
+        with col_addr2: d_zip = st.text_input("收货邮编", "49022")
+        with col_addr3: d_state = st.text_input("收货州代码", "MI")
+
+        # B. 包裹录入区 (Data Editor)
+        st.markdown("###### 📦 包裹明细 (可直接修改表格)")
+        
+        # 初始化一个默认行
+        default_data = pd.DataFrame(
+            [{"长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0}]
+        )
+        
+        # 显示可编辑表格 (num_rows="dynamic" 允许添加删除行)
+        edited_df = st.data_editor(
+            default_data,
+            num_rows="dynamic",
+            column_config={
+                "长": st.column_config.NumberColumn("长 (in)", min_value=0.1, required=True),
+                "宽": st.column_config.NumberColumn("宽 (in)", min_value=0.1, required=True),
+                "高": st.column_config.NumberColumn("高 (in)", min_value=0.1, required=True),
+                "实重": st.column_config.NumberColumn("实重 (lbs)", min_value=0.1, required=True),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # C. 触发计算
+        if st.button("🚀 立即计算总费用", type="primary", use_container_width=True):
+            if not (o_zip and d_zip and d_state):
+                st.warning("⚠️ 请完善地址信息！")
+            elif edited_df.empty:
+                st.warning("⚠️ 请至少添加一个包裹！")
+            else:
+                # 构造包含地址的完整数据
+                calc_data = edited_df.copy()
+                calc_data['发货邮编'] = o_zip
+                calc_data['收货邮编'] = d_zip
+                calc_data['收货州'] = d_state
+                
+                # 调用核心算法
+                res, err = calculate_shipment(df_zone, df_rates, remote_zips, calc_data)
+                
+                if err:
+                    st.error(f"❌ 计算失败: {err}")
+                else:
+                    st.divider()
+                    # 结果展示区
+                    c1, c2, c3 = st.columns(3)
+                    with c1: st.metric("💰 预估总运费", f"${res['总费用']}")
+                    with c2: st.metric("⚖️ 最终计费重", f"{res['计费重']} lbs")
+                    with c3: st.metric("📦 包裹数量", f"{res['包裹数']} 件")
+                    
+                    st.success(f"📍 路线: {res['发货仓']} ➡️ {d_state} (分区 {res['分区']})")
+                    
+                    # 费用明细表
+                    detail_df = pd.DataFrame({
+                        "费用项": ["基础运费", "燃油费", "偏远费", "超尺费"],
+                        "金额": [f"${res['基础运费']}", f"${res['燃油费']}", f"${res['偏远费']}", f"${res['超尺费']}"]
+                    })
+                    st.table(detail_df)
+
+    # --- TAB 2: 批量上传 (保持原样) ---
+    with tab2:
+        st.markdown("### 📥 批量计算 (Excel)")
+        st.markdown("适用于一次性计算几十个不同的订单。**订单号相同的行会自动合并。**")
+        
         template_df = pd.DataFrame(columns=["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"])
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             template_df.to_excel(writer, index=False)
+        st.download_button("📄 下载模板", buffer.getvalue(), "LTL_Template_V4.xlsx")
         
-        st.download_button("📄 下载模板", buffer.getvalue(), "LTL_Multi_Piece_Template.xlsx")
-        
-        st.markdown("---")
+        st.divider()
         uploaded_file = st.file_uploader("上传 Excel 文件", type=['xlsx'])
         
         if uploaded_file:
@@ -197,19 +231,14 @@ else:
                 required = ["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"]
                 
                 if not all(c in df_input.columns for c in required):
-                    st.error("❌ 格式错误！请务必使用新模板，确认包含【订单号】列。")
+                    st.error("❌ 格式错误！请使用新模板。")
                 else:
-                    # 核心逻辑：按订单号分组
                     grouped = df_input.groupby('订单号')
                     results = []
-                    
-                    st.write(f"📊 识别到 {len(grouped)} 个独立订单，正在合并计算...")
                     progress_bar = st.progress(0)
                     
                     for i, (order_id, group_df) in enumerate(grouped):
                         res, err = calculate_shipment(df_zone, df_rates, remote_zips, group_df)
-                        
-                        # 结果行
                         row_res = {'订单号': order_id}
                         if err:
                             row_res['状态'] = '失败'
@@ -217,7 +246,6 @@ else:
                         else:
                             row_res['状态'] = '成功'
                             row_res.update(res)
-                        
                         results.append(row_res)
                         progress_bar.progress((i + 1) / len(grouped))
                     
@@ -228,7 +256,6 @@ else:
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         res_df.to_excel(writer, index=False)
-                    st.download_button("📥 下载合并后结果", output.getvalue(), "LTL_Result_Merged.xlsx", type="primary")
-                    
+                    st.download_button("📥 下载结果", output.getvalue(), "LTL_Result.xlsx", type="primary")
             except Exception as e:
                 st.error(f"❌ 处理失败: {e}")
