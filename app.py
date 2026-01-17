@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import io
 
-# ================= 1. 核心配置 (V4.8 ) =================
+# ================= 1. 核心配置 (V4.9 - SKU备注版) =================
 WAREHOUSE_DB = [
     {"name": "AI美西001 (Ontario)", "zip": "91761", "zone_code": "CA"},
     {"name": "AI美西002 (Ontario)", "zip": "91761", "zone_code": "CA"},
@@ -31,7 +31,7 @@ CONFIG = {
     'OVERSIZE_FEE': 50,
 }
 
-# ================= 2. 数据加载 =================
+# ================= 2. 数据加载 (极速版) =================
 @st.cache_data
 def load_data_optimized():
     if not os.path.exists(CONFIG['FILE_NAME']):
@@ -88,8 +88,16 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
     total_dim_weight = 0
     is_oversize = False
     
+    # 提取 SKU 列表用于展示
+    sku_list = []
+
     for _, row in shipment_data.iterrows():
         l, w, h, weight = float(row['长']), float(row['宽']), float(row['高']), float(row['实重'])
+        
+        # 收集非空的 SKU 标记
+        if '常用SKU标记' in row and pd.notna(row['常用SKU标记']) and str(row['常用SKU标记']).strip() != "":
+            sku_list.append(str(row['常用SKU标记']))
+            
         total_actual_weight += weight
         total_dim_weight += (l * w * h) / CONFIG['DIM_FACTOR']
         if weight > 250 or (weight > 150 and max(l,w,h) > 72):
@@ -116,10 +124,14 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
     oversize = CONFIG['OVERSIZE_FEE'] if is_oversize else 0
     total = base + fuel + remote + oversize
     
+    # 将 SKU 列表合并为字符串
+    sku_summary = ", ".join(sku_list) if sku_list else "-"
+    
     return {
         '发货仓': f"{warehouse_zone_code}区", 
         '分区': zone, 
         '包裹数': len(shipment_data),
+        '包含SKU': sku_summary, # 新增返回字段
         '计费重': round(billable, 2),
         '基础运费': round(base, 2), '燃油费': round(fuel, 2),
         '偏远费': round(remote, 2), '超尺费': round(oversize, 2),
@@ -127,9 +139,9 @@ def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
     }, None
 
 # ================= 4. 界面逻辑 =================
-st.set_page_config(page_title="LTL 运费计算器 V4.8", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="LTL 运费计算器 V4.9", page_icon="🚚", layout="wide")
 st.title("🚚 马士基 LTL 运费计算器")
-st.caption("逻辑版本: V4.8 ")
+st.caption("逻辑版本: V4.9")
 
 zone_dict, rate_dict, remote_zips, err_msg = load_data_optimized()
 
@@ -140,7 +152,7 @@ else:
 
     # --- TAB 1: 交互式 ---
     with tab1:
-        st.info("💡 操作提示：如果多加了一行，直接在【删除】列打勾，计算时会自动忽略。")
+        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。")
         
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -151,34 +163,34 @@ else:
 
         st.markdown("###### 📦 包裹明细")
         
-        # 🌟 核心修改 1: 默认数据增加 '删除' 列
+        # 🌟 核心修改 1: 默认数据增加 '常用SKU标记'
         default_data = pd.DataFrame([
-            {"长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0, "删除": False}
+            {"常用SKU标记": "例如：升降桌A款", "长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0, "删除": False}
         ])
         
-        # 🌟 核心修改 2: 配置 Checkbox 列
+        # 🌟 核心修改 2: 把 SKU 列放在最前面 (TextColumn)
         edited_df = st.data_editor(
             default_data, 
             num_rows="dynamic",
             column_config={
+                "常用SKU标记": st.column_config.TextColumn("常用SKU标记 (选填)", help="业务备注，不影响价格", width="medium"),
                 "长": st.column_config.NumberColumn("长 (in)", required=True),
                 "宽": st.column_config.NumberColumn("宽 (in)", required=True),
                 "高": st.column_config.NumberColumn("高 (in)", required=True),
                 "实重": st.column_config.NumberColumn("实重 (lbs)", required=True),
-                "删除": st.column_config.CheckboxColumn("删除?", help="勾选后，该包裹将不参与计算", default=False)
+                "删除": st.column_config.CheckboxColumn("删除?", default=False)
             }, 
             use_container_width=True
         )
 
         if st.button("🚀 立即计算", type="primary", use_container_width=True):
-            # 🌟 核心修改 3: 过滤掉打勾的行
             valid_rows = edited_df[~edited_df['删除']].copy()
             deleted_count = len(edited_df) - len(valid_rows)
 
             if not (d_zip and d_state):
                 st.warning("⚠️ 请完善收货地址信息")
             elif valid_rows.empty:
-                st.warning("⚠️ 请至少保留一个有效包裹（未勾选删除）！")
+                st.warning("⚠️ 请至少保留一个有效包裹！")
             else:
                 if deleted_count > 0:
                     st.toast(f"🗑️ 已自动忽略 {deleted_count} 个标记删除的包裹")
@@ -193,6 +205,10 @@ else:
                 if err: st.error(err)
                 else:
                     st.divider()
+                    
+                    # 结果卡片增加 SKU 展示
+                    st.success(f"📦 **包含货品**: {res['包含SKU']}")
+                    
                     c_a, c_b, c_c = st.columns(3)
                     with c_a: st.metric("💰 预估总运费", f"${res['总费用']}")
                     with c_b: st.metric("⚖️ 最终计费重", f"{res['计费重']} lbs")
@@ -209,17 +225,19 @@ else:
         with st.expander("查看仓库对照表"):
             st.dataframe(pd.DataFrame(WAREHOUSE_DB)[['name','zip']], hide_index=True)
 
-        template_df = pd.DataFrame(columns=["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"])
+        # 批量模板也顺便加个 SKU 列，万一他们想备注
+        template_df = pd.DataFrame(columns=["订单号", "常用SKU标记", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"])
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             template_df.to_excel(writer, index=False)
-        st.download_button("📄 下载模板", buffer.getvalue(), "LTL_Template.xlsx")
+        st.download_button("📄 下载模板 (含SKU列)", buffer.getvalue(), "LTL_Template_V4.9.xlsx")
         
         st.divider()
         uploaded_file = st.file_uploader("上传 Excel", type=['xlsx'])
         if uploaded_file:
             try:
                 df_input = pd.read_excel(uploaded_file, engine='openpyxl')
+                # 兼容旧模板，不强制要求 SKU 列
                 required = ["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"]
                 if not all(c in df_input.columns for c in required):
                     st.error("❌ 格式错误")
