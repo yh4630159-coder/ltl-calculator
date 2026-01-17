@@ -20,26 +20,26 @@ CONFIG = {
 
 search = SearchEngine()
 
-# ================= 2. 数据加载 (Excel 版) =================
+# ================= 2. 数据加载 (Excel 版 - 修复版) =================
 @st.cache_data
 def load_data():
     try:
-        # 1. 读取分区表 (指定 Sheet 名为 '分区')
-        df_zone = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='分区')
+        # 1. 读取分区表 (指定引擎)
+        df_zone = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='分区', engine='openpyxl')
         
-        # 2. 读取费率表 (指定 Sheet 名为 '基础运费',同样不需要表头因为我们要自己找)
-        df_rates_raw = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='基础运费', header=None)
+        # 2. 读取费率表
+        df_rates_raw = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='基础运费', header=None, engine='openpyxl')
         
-        # 3. 读取偏远邮编 (指定 Sheet 名为 '偏远邮编')
-        df_remote = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='偏远邮编')
+        # 3. 读取偏远邮编
+        df_remote = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='偏远邮编', engine='openpyxl')
         
         # --- 数据清洗逻辑 (保持不变) ---
         
         # 清洗费率表
         header_idx = 0
-        for r in range(20): # 稍微多找几行，防止Excel格式变动
-            # Excel读取后可能是NaN，转为str判断
-            row_values = df_rates_raw.iloc[r].astype(str).values
+        for r in range(20): 
+            # 强制转字符串防止NaN报错
+            row_values = df_rates_raw.iloc[r].fillna('').astype(str).values
             if '分区' in row_values:
                 header_idx = r
                 break
@@ -51,11 +51,12 @@ def load_data():
         rates = rates[rates['Zone'].isin(['A','B','C','D','E','F'])]
         
         # 清洗偏远邮编
-        # Excel读取的邮编可能是数字类型，强制转字符串
         remote_zips = set(df_remote.iloc[:, 0].astype(str).str.replace('.0', '', regex=False).str.strip().tolist())
         
         return df_zone, rates, remote_zips
     except Exception as e:
+        # 这里会打印具体的错误信息，方便我们调试
+        st.error(f"数据加载失败: {str(e)}")
         return None, None, None
 
 # ================= 3. 核心计算函数 (V4.0 逻辑) =================
