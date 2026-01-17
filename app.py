@@ -2,22 +2,33 @@ import streamlit as st
 import pandas as pd
 import os
 
-# ================= 1. 核心配置 =================
+# ================= 1. 核心配置 (V4.2 - 全仓库版) =================
 CONFIG = {
-    'FILE_NAME': 'data.xlsx',  # ⚠️ 必须确保你上传的文件名是这个
+    'FILE_NAME': 'data.xlsx',
     'DIM_FACTOR': 200,
     'MIN_BILLABLE_WEIGHT': 173,
     'FUEL_RATE': 0.315,
     'REMOTE_RATE': 28,
     'OVERSIZE_FEE': 50,
+    
+    # 仓库映射逻辑：邮编 -> 计费分区 (CA/NJ/SAV/HOU)
+    # 注意：Excel里只有这4个分区列，所以必须把所有仓库映射到这4个代码上
     'WAREHOUSE_MAP': {
-        '08820': 'NJ', 
-        '77494': 'HOU',
-        '31326': 'GA', 
-        '90046': 'CA'
+        # --- AI 仓系列 ---
+        '91761': 'CA',   # AI美西001 / AI美西002 (Ontario, CA)
+        '30294': 'SAV',  # AI美南GA002 (Ellenwood, GA) -> 归入 SAV 分区
+        '08820': 'NJ',   # AI美东NJ003 (Edison, NJ)
+        '31322': 'SAV',  # AI美南SAV仓002 (Pooler, GA)
+        '77064': 'HOU',  # AI美南TX仓001 (Houston, TX)
+        '30517': 'SAV',  # AI美南GA001仓 (Braselton, GA) -> 归入 SAV 分区
+
+        # --- 乐歌 仓系列 ---
+        '31326': 'SAV',  # 乐歌美南SAV (Rincon, GA)
+        '92571': 'CA',   # 乐歌美西CAP仓 (Perris, CA)
+        '08016': 'NJ',   # 乐歌美东NJF (Burlington, NJ)
+        '77494': 'HOU'   # 乐歌美中南HOU07 (Katy, TX)
     }
 }
-
 # ================= 2. 数据加载 (带排错功能) =================
 @st.cache_data
 def load_data():
