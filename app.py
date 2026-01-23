@@ -152,7 +152,7 @@ else:
 
     # --- TAB 1: 交互式 ---
     with tab1:
-        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。")
+        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。删除不用的条目使用DELTE键哈")
         
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -264,4 +264,5 @@ else:
                         res_df.to_excel(writer, index=False)
                     st.download_button("📥 下载结果", output.getvalue(), "LTL_Fast_Result.xlsx", type="primary")
             except Exception as e:
+
                 st.error(f"❌: {e}")
