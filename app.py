@@ -1,267 +1,504 @@
 import streamlit as st
 import pandas as pd
-import os
 import io
+import altair as alt
+import gc
 
-# ================= 1. 核心配置 (V4.9 - SKU备注版) =================
-WAREHOUSE_DB = [
-    {"name": "AI美西001 (Ontario)", "zip": "91761", "zone_code": "CA"},
-    {"name": "AI美西002 (Ontario)", "zip": "91761", "zone_code": "CA"},
-    {"name": "AI美东NJ003 (Edison)", "zip": "08820", "zone_code": "NJ"},
-    {"name": "AI美南GA002 (Ellenwood)", "zip": "30294", "zone_code": "SAV"},
-    {"name": "AI美南SAV仓002 (Pooler)", "zip": "31322", "zone_code": "SAV"},
-    {"name": "AI美南GA001仓 (Braselton)", "zip": "30517", "zone_code": "SAV"},
-    {"name": "AI美南TX仓001 (Houston)", "zip": "77064", "zone_code": "HOU"},
-    
-    {"name": "乐歌美南SAV (Rincon)", "zip": "31326", "zone_code": "SAV"},
-    {"name": "乐歌美西CAP仓 (Perris)", "zip": "92571", "zone_code": "CA"},
-    {"name": "乐歌美东NJF (Burlington)", "zip": "08016", "zone_code": "NJ"},
-    {"name": "乐歌美中南HOU07 (Katy)", "zip": "77494", "zone_code": "HOU"}
-]
-
-WAREHOUSE_OPTIONS = {f"{w['name']} - {w['zip']}": w['zip'] for w in WAREHOUSE_DB}
-ZIP_TO_ZONE_MAP = {w['zip']: w['zone_code'] for w in WAREHOUSE_DB}
-
-CONFIG = {
-    'FILE_NAME': 'data.xlsx',
-    'DIM_FACTOR': 200,
-    'MIN_BILLABLE_WEIGHT': 173,
-    'FUEL_RATE': 0.315,
-    'REMOTE_RATE': 28,
-    'OVERSIZE_FEE': 50,
+# ================= 1. 配置与映射 =================
+COLUMN_MAPS = {
+    'WP': { 
+        'SKU': 'SKU', 'Warehouse': '仓库/Warehouse', 
+        'Qty': '数量/Quantity', 'Fee': '金额/Amount', 
+        'Age': '库龄/Library of Age', 'Vol': '体积(m³)',
+        'Full_Name': 'WesternPost'
+    },
+    'LG': { 
+        'SKU': '乐仓货品编码', 'Warehouse': '仓库', 
+        'Qty': '数量', 'Fee': '计算金额', 
+        'Age': '库龄', 'Vol': '总体积',
+        'Full_Name': 'Lecangs'
+    },
+    'AI': { 
+        'SKU': 'SKU', 'Warehouse': '仓库', 
+        'Qty': '库存', 'Fee': '费用', 
+        'Age': '在库天数', 'Vol': '立方数',
+        'Full_Name': 'AI'
+    },
+    'WL': { 
+        'SKU': '商品SKU', 'Warehouse': '实际发货仓库', 
+        'Qty': '库存总数_QTY', 'Fee': '计费总价', 
+        'Age': '库存库龄_CD', 'Vol': '计费总体积_立方米',
+        'Full_Name': 'WWL'
+    }
 }
 
-# ================= 2. 数据加载 (极速版) =================
-@st.cache_data
-def load_data_optimized():
-    if not os.path.exists(CONFIG['FILE_NAME']):
-        return None, None, None, f"找不到文件 '{CONFIG['FILE_NAME']}'"
+# 库龄分段逻辑
+AGE_BINS = [-1, 30, 60, 90, 120, 180, 360, 99999]
+AGE_LABELS = ['0-30天', '31-60天', '61-90天', '91-120天', '121-180天', '181-360天', '360天+']
+AGE_MAP = {label: i for i, label in enumerate(AGE_LABELS)}
 
+# ================= 2. 核心处理逻辑 =================
+
+def parse_filename(filename):
     try:
-        df_zone = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='分区', engine='openpyxl')
-        df_rates_raw = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='基础运费', header=None, engine='openpyxl')
-        df_remote = pd.read_excel(CONFIG['FILE_NAME'], sheet_name='偏远邮编', engine='openpyxl')
-        
-        zone_dict = {}
-        needed_cols = ['state', 'CA发货分区', 'NJ发货分区', 'SAV发货分区', 'HOU发货分区']
-        valid_cols = [c for c in needed_cols if c in df_zone.columns]
-        for _, row in df_zone[valid_cols].iterrows():
-            state = str(row['state']).strip().upper()
-            if 'CA发货分区' in valid_cols: zone_dict[(state, 'CA')] = row['CA发货分区']
-            if 'NJ发货分区' in valid_cols: zone_dict[(state, 'NJ')] = row['NJ发货分区']
-            if 'SAV发货分区' in valid_cols: zone_dict[(state, 'SAV')] = row['SAV发货分区']
-            if 'HOU发货分区' in valid_cols: zone_dict[(state, 'HOU')] = row['HOU发货分区']
+        name_body = filename.rsplit('.', 1)[0]
+        parts = name_body.split('_')
+        if len(parts) >= 3:
+            dept = parts[0]
+            raw_code = parts[1].upper()
+            provider_code = None
+            for key in COLUMN_MAPS.keys():
+                if key in raw_code:
+                    provider_code = key
+                    break
+            date_str = parts[2]
+            return dept, provider_code, date_str
+        return None, None, None
+    except Exception:
+        return None, None, None
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data_cached(file_content, file_name):
+    try:
+        file = io.BytesIO(file_content)
+        file.name = file_name 
+
+        dept, provider_code, date_str = parse_filename(file.name)
+        
+        if not dept:
+            dept = "默认部门"
+            for code in COLUMN_MAPS.keys():
+                if code in file.name.upper():
+                    provider_code = code
+                    break
+            date_str = "最新"
+
+        if not provider_code:
+            return pd.DataFrame()
+
+        df = None
+        try: df = pd.read_excel(file, engine='openpyxl', header=None); 
+        except: pass
+        if df is None:
+            try: file.seek(0); df = pd.read_csv(file, encoding='utf-8', header=None)
+            except: pass
+        if df is None:
+            try: file.seek(0); df = pd.read_csv(file, encoding='gb18030', header=None)
+            except: pass
+                
+        if df is None:
+            return pd.DataFrame()
+
+        mapping = COLUMN_MAPS[provider_code]
+        
         header_idx = 0
-        for r in range(20): 
-            row_values = df_rates_raw.iloc[r].fillna('').astype(str).values
-            if '分区' in row_values:
-                header_idx = r
+        expected_cols = set(mapping.values())
+        expected_cols.discard(mapping.get('Full_Name'))
+        
+        for i in range(min(20, len(df))):
+            row_values = df.iloc[i].astype(str).str.strip().tolist()
+            row_values = [x.replace('\ufeff', '') for x in row_values]
+            match_count = sum(1 for x in row_values if x in expected_cols)
+            if match_count >= 2:
+                header_idx = i
                 break
-        rates_df = df_rates_raw.iloc[header_idx+1:, 10:17]
-        rates_df.columns = ['Zone', 'Min_West', 'Rate_West_Low', 'Rate_West_High', 'Min_NonWest', 'Rate_NonWest_Low', 'Rate_NonWest_High']
-        rates_df = rates_df.dropna(subset=['Zone'])
-        rates_df = rates_df[rates_df['Zone'].isin(['A','B','C','D','E','F'])]
-        rate_dict = rates_df.set_index('Zone').to_dict('index')
-
-        remote_zips = set(df_remote.iloc[:, 0].astype(str).str.replace('.0', '', regex=False).str.strip().tolist())
-        return zone_dict, rate_dict, remote_zips, None
-    except Exception as e:
-        return None, None, None, f"数据读取错误: {str(e)}"
-
-# ================= 3. 核心计算逻辑 =================
-def calculate_shipment_fast(zone_dict, rate_dict, remote_zips, shipment_data):
-    if shipment_data.empty: return None, "无有效包裹数据"
-    
-    first_item = shipment_data.iloc[0]
-    o_zip = str(first_item['发货邮编']).replace('.0', '').strip()
-    d_zip = str(first_item['收货邮编']).replace('.0', '').strip()
-    d_state = str(first_item['收货州']).upper().strip()
-    
-    warehouse_zone_code = ZIP_TO_ZONE_MAP.get(o_zip)
-    if not warehouse_zone_code: return None, f"发货邮编 {o_zip} 无效"
-
-    zone = zone_dict.get((d_state, warehouse_zone_code))
-    if not zone: return None, f"不支持发往 {d_state}"
-
-    total_actual_weight = 0
-    total_dim_weight = 0
-    is_oversize = False
-    
-    # 提取 SKU 列表用于展示
-    sku_list = []
-
-    for _, row in shipment_data.iterrows():
-        l, w, h, weight = float(row['长']), float(row['宽']), float(row['高']), float(row['实重'])
         
-        # 收集非空的 SKU 标记
-        if '常用SKU标记' in row and pd.notna(row['常用SKU标记']) and str(row['常用SKU标记']).strip() != "":
-            sku_list.append(str(row['常用SKU标记']))
+        new_columns = df.iloc[header_idx].astype(str).str.strip().str.replace('\ufeff', '')
+        df = df.iloc[header_idx+1:].copy()
+        df.columns = new_columns
+
+        if provider_code == 'WL':
+            if not df.empty:
+                df = df.iloc[1:]
+
+        valid_map = {k: v for k, v in mapping.items() if v in df.columns}
+        rename_dict = {v: k for k, v in valid_map.items()}
+        df = df.rename(columns=rename_dict)
+        
+        required_cols = ['SKU', 'Warehouse', 'Qty', 'Fee', 'Age', 'Vol']
+        for col in required_cols:
+            if col not in df.columns: df[col] = 0 
+                
+        for col in ['Qty', 'Fee', 'Age', 'Vol']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
-        total_actual_weight += weight
-        total_dim_weight += (l * w * h) / CONFIG['DIM_FACTOR']
-        if weight > 250 or (weight > 150 and max(l,w,h) > 72):
-            is_oversize = True
+        cut_series = pd.cut(df['Age'], bins=AGE_BINS, labels=AGE_LABELS, right=True)
+        df['Age_Range'] = cut_series.astype(str)
+        df.loc[df['Age_Range'] == 'nan', 'Age_Range'] = '360天+'
+        df['Age_Range'] = df['Age_Range'].str.strip()
 
-    billable = max(total_actual_weight, total_dim_weight, CONFIG['MIN_BILLABLE_WEIGHT'])
-
-    is_west = (warehouse_zone_code == 'CA')
-    r_data = rate_dict.get(zone)
-    if not r_data: return None, f"缺 {zone} 区费率"
-
-    if is_west:
-        rate = float(r_data['Rate_West_High'] if billable >= 500 else r_data['Rate_West_Low'])
-        min_c = float(r_data['Min_West'])
-    else:
-        rate = float(r_data['Rate_NonWest_High'] if billable >= 500 else r_data['Rate_NonWest_Low'])
-        min_c = float(r_data['Min_NonWest'])
+        df['Dept'] = str(dept)
+        df['Provider'] = str(mapping['Full_Name'])
+        df['Date'] = str(date_str)
         
-    base = max(billable * rate, min_c)
-    fuel = base * CONFIG['FUEL_RATE']
-    
-    is_remote = d_zip in remote_zips
-    remote = (billable / 100) * CONFIG['REMOTE_RATE'] if is_remote else 0
-    oversize = CONFIG['OVERSIZE_FEE'] if is_oversize else 0
-    total = base + fuel + remote + oversize
-    
-    # 将 SKU 列表合并为字符串
-    sku_summary = ", ".join(sku_list) if sku_list else "-"
-    
-    return {
-        '发货仓': f"{warehouse_zone_code}区", 
-        '分区': zone, 
-        '包裹数': len(shipment_data),
-        '包含SKU': sku_summary, # 新增返回字段
-        '计费重': round(billable, 2),
-        '基础运费': round(base, 2), '燃油费': round(fuel, 2),
-        '偏远费': round(remote, 2), '超尺费': round(oversize, 2),
-        '总费用': round(total, 2)
-    }, None
+        gc.collect()
+        return df
+        
+    except Exception:
+        return pd.DataFrame()
 
-# ================= 4. 界面逻辑 =================
-st.set_page_config(page_title="LTL 运费计算器 V4.9", page_icon="🚚", layout="wide")
-st.title("🚚 马士基 LTL 运费计算器")
-st.caption("逻辑版本: V4.9")
+# ================= 3. 界面逻辑 =================
+st.set_page_config(page_title="海外仓库存 BI V4.8", page_icon="🏢", layout="wide")
+st.title("🏢 海外仓库存分析看板 V4.8 ")
 
-zone_dict, rate_dict, remote_zips, err_msg = load_data_optimized()
+with st.sidebar:
+    st.header("📂 数据中心")
+    uploaded_files = st.file_uploader("批量上传文件", type=['xlsx', 'xls', 'csv'], accept_multiple_files=True)
+    
+    if st.button("🧹 刷新缓存"):
+        st.cache_data.clear()
+        st.success("缓存已清除")
 
-if err_msg:
-    st.error(f"❌ 系统错误: {err_msg}")
+    dfs = []
+    if uploaded_files:
+        my_bar = st.progress(0, text="正在解析...")
+        for i, file in enumerate(uploaded_files):
+            df = load_data_cached(file.getvalue(), file.name)
+            if not df.empty:
+                dfs.append(df)
+            my_bar.progress((i + 1) / len(uploaded_files))
+        my_bar.empty()
+        st.success(f"✅ 已加载 {len(dfs)} 个有效文件")
+
+if not dfs:
+    st.info("👈 请在左侧上传数据文件")
 else:
-    tab1, tab2 = st.tabs(["🧮 交互式计算", "📥 批量上传"])
+    full_df = pd.concat(dfs, ignore_index=True)
+    
+    for col in ['Dept', 'Provider', 'Warehouse', 'Date']:
+        if col in full_df.columns:
+            full_df[col] = full_df[col].astype(str)
 
-    # --- TAB 1: 交互式 ---
+    tab1, tab2 = st.tabs(["📊 全景详情 (SKU级)", "🆚 历史趋势 & 风险洞察"])
+    
+    # ================= TAB 1: 全景详情 =================
     with tab1:
-        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。")
-        
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            selected_wh_label = st.selectbox("选择发货仓库", list(WAREHOUSE_OPTIONS.keys()))
-            o_zip_val = WAREHOUSE_OPTIONS[selected_wh_label]
-        with c2: d_zip = st.text_input("收货邮编", "49022")
-        with c3: d_state = st.text_input("收货州代码", "MI")
+        try:
+            # 筛选区域
+            all_depts = sorted(full_df['Dept'].unique().tolist())
+            all_depts.insert(0, "全部汇总")
+            
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: sel_dept = st.selectbox("① 选择部门", all_depts, key='t1_d')
+            df_l1 = full_df if sel_dept == "全部汇总" else full_df[full_df['Dept'] == sel_dept]
 
-        st.markdown("###### 📦 包裹明细")
-        
-        # 🌟 核心修改 1: 默认数据增加 '常用SKU标记'
-        default_data = pd.DataFrame([
-            {"常用SKU标记": "例如：升降桌A款", "长": 48.0, "宽": 40.0, "高": 50.0, "实重": 500.0, "删除": False}
-        ])
-        
-        # 🌟 核心修改 2: 把 SKU 列放在最前面 (TextColumn)
-        edited_df = st.data_editor(
-            default_data, 
-            num_rows="dynamic",
-            column_config={
-                "常用SKU标记": st.column_config.TextColumn("常用SKU标记 (选填)", help="业务备注，不影响价格", width="medium"),
-                "长": st.column_config.NumberColumn("长 (in)", required=True),
-                "宽": st.column_config.NumberColumn("宽 (in)", required=True),
-                "高": st.column_config.NumberColumn("高 (in)", required=True),
-                "实重": st.column_config.NumberColumn("实重 (lbs)", required=True),
-                "删除": st.column_config.CheckboxColumn("删除?", default=False)
-            }, 
-            use_container_width=True
-        )
+            avail_dates = sorted(df_l1['Date'].unique().tolist(), reverse=True)
+            with c2: sel_date = st.selectbox("② 选择月份 (基准)", avail_dates, key='t1_dt')
+            df_l2 = df_l1[df_l1['Date'] == sel_date]
 
-        if st.button("🚀 立即计算", type="primary", use_container_width=True):
-            valid_rows = edited_df[~edited_df['删除']].copy()
-            deleted_count = len(edited_df) - len(valid_rows)
-
-            if not (d_zip and d_state):
-                st.warning("⚠️ 请完善收货地址信息")
-            elif valid_rows.empty:
-                st.warning("⚠️ 请至少保留一个有效包裹！")
+            avail_provs = sorted(df_l2['Provider'].unique().tolist())
+            avail_provs.insert(0, "全部汇总")
+            with c3: sel_prov = st.selectbox("③ 选择服务商", avail_provs, key='t1_p')
+            df_l3 = df_l2 if sel_prov == "全部汇总" else df_l2[df_l2['Provider'] == sel_prov]
+                
+            avail_whs = sorted(df_l3['Warehouse'].unique().tolist())
+            with c4: sel_whs = st.multiselect("④ 选择仓库 (可多选)", avail_whs, default=avail_whs)
+            
+            if not sel_whs:
+                st.warning("请至少选择一个仓库")
+                final_df = pd.DataFrame()
             else:
-                if deleted_count > 0:
-                    st.toast(f"🗑️ 已自动忽略 {deleted_count} 个标记删除的包裹")
+                final_df = df_l3[df_l3['Warehouse'].isin(sel_whs)]
+            
+            if not final_df.empty:
+                # 顶部 KPI
+                wh_display = "多个仓库" if len(sel_whs) > 1 else sel_whs[0]
+                st.markdown(f"### 📋 数据视图：{sel_dept} · {sel_prov} · {wh_display}")
 
-                calc_data = valid_rows.copy()
-                calc_data['发货邮编'] = o_zip_val
-                calc_data['收货邮编'] = d_zip
-                calc_data['收货州'] = d_state
+                k1, k2, k3 = st.columns(3)
+                k1.metric("总库存 (Qty)", f"{final_df['Qty'].sum():,.0f}")
+                k2.metric("总体积 (Vol)", f"{final_df['Vol'].sum():,.2f} m³")
+                k3.metric("单日总费用 (Fee)", f"${final_df['Fee'].sum():,.2f}")
                 
-                res, err = calculate_shipment_fast(zone_dict, rate_dict, remote_zips, calc_data)
+                # 库龄分段统计表
+                summary = final_df.groupby('Age_Range').agg({'Fee':'sum','Qty':'sum','Vol':'sum'}).reset_index()
+                order_map = {l: i for i, l in enumerate(AGE_LABELS)}
+                summary['sort'] = summary['Age_Range'].map(order_map).fillna(999)
+                summary = summary.sort_values('sort').drop('sort', axis=1)
                 
-                if err: st.error(err)
+                total_fee = final_df['Fee'].sum()
+                total_vol = final_df['Vol'].sum()
+                summary['费用占比'] = (summary['Fee'] / total_fee * 100).fillna(0)
+                summary['体积占比'] = (summary['Vol'] / total_vol * 100).fillna(0)
+                
+                st.dataframe(
+                    summary.style.format({
+                        'Fee':'${:.2f}', 'Vol':'{:.2f}', '费用占比':'{:.1f}%', '体积占比':'{:.1f}%'
+                    }), 
+                    use_container_width=True
+                )
+                
+                st.divider()
+                st.markdown("#### 🔍 异常库存深钻 (含跨月追踪)")
+                
+                valid_ages = [l for l in AGE_LABELS if l in final_df['Age_Range'].unique()]
+                
+                if valid_ages:
+                    # 交互控制
+                    r_col1, r_col2 = st.columns([3, 1])
+                    with r_col1:
+                        rng = st.radio("锁定库龄段", valid_ages, horizontal=True, index=len(valid_ages)-1, key='t1_r')
+                    
+                    show_agg = False
+                    if sel_dept == "全部汇总" or sel_prov == "全部汇总" or len(sel_whs) > 1:
+                        with r_col2:
+                            st.write("")
+                            st.write("") 
+                            show_agg = st.checkbox("🔀 SKU 宏观聚合", value=True, key="chk_agg_mode")
+
+                    other_dates = [d for d in full_df['Date'].unique() if d != sel_date]
+                    other_dates.sort(reverse=True)
+                    target_month = st.selectbox(
+                        "📅 开启下月追踪 (选择一个比基准月晚的月份，留空则关闭)", 
+                        ["关闭追踪"] + other_dates,
+                        index=0
+                    )
+
+                    # 数据准备
+                    drill = final_df[final_df['Age_Range'] == rng].copy()
+                    
+                    if drill.empty:
+                        st.info("无数据")
+                    else:
+                        # 1. 准备基准数据
+                        if show_agg:
+                            base_df = drill.groupby('SKU').agg({
+                                'Qty': 'sum', 'Vol': 'sum', 'Fee': 'sum', 'Age': 'mean',
+                                'Warehouse': 'nunique', 'Dept': 'nunique', 'Provider': 'nunique'
+                            }).reset_index()
+                            
+                            def build_info(row):
+                                infos = []
+                                if sel_dept == "全部汇总" and row['Dept'] > 1: infos.append(f"{row['Dept']}个部门")
+                                if sel_prov == "全部汇总" and row['Provider'] > 1: infos.append(f"{row['Provider']}个服务商")
+                                infos.append(f"{row['Warehouse']}个仓")
+                                return " | ".join(infos)
+                            base_df['分布情况'] = base_df.apply(build_info, axis=1)
+                        else:
+                            base_df = drill[['SKU', 'Warehouse', 'Qty', 'Vol', 'Fee', 'Age']].copy()
+
+                        # 取 TOP 50
+                        base_df = base_df.sort_values('Fee', ascending=False).head(50)
+
+                        # 2. 追踪逻辑
+                        is_tracking = (target_month != "关闭追踪")
+                        
+                        if is_tracking:
+                            mask_track = (
+                                (full_df['Date'] == target_month) & 
+                                (full_df['SKU'].isin(base_df['SKU']))
+                            )
+                            if sel_dept != "全部汇总": mask_track &= (full_df['Dept'] == sel_dept)
+                            if sel_prov != "全部汇总": mask_track &= (full_df['Provider'] == sel_prov)
+                            if len(sel_whs) > 0: mask_track &= (full_df['Warehouse'].isin(sel_whs))
+                            
+                            track_raw = full_df[mask_track].copy()
+                            
+                            if show_agg:
+                                track_ready = track_raw.groupby('SKU').agg({
+                                    'Qty': 'sum', 'Vol': 'sum', 'Fee': 'sum', 'Age': 'mean'
+                                }).reset_index()
+                                merge_on = ['SKU']
+                            else:
+                                track_ready = track_raw[['SKU', 'Warehouse', 'Qty', 'Vol', 'Fee', 'Age']]
+                                merge_on = ['SKU', 'Warehouse']
+
+                            final_show = pd.merge(base_df, track_ready, on=merge_on, suffixes=('', '_下月'), how='left')
+                            
+                            # 填充0
+                            for col in ['Qty_下月', 'Vol_下月', 'Fee_下月', 'Age_下月']:
+                                final_show[col] = final_show[col].fillna(0)
+                                
+                            # 计算 Delta
+                            final_show['库存变化'] = final_show['Qty_下月'] - final_show['Qty']
+                            final_show['体积变化'] = final_show['Vol_下月'] - final_show['Vol']
+                            final_show['费用变化'] = final_show['Fee_下月'] - final_show['Fee']
+                            final_show['库龄增量'] = final_show['Age_下月'] - final_show['Age']
+                            
+                        else:
+                            final_show = base_df.copy()
+
+                        # 3. 字段整理
+                        current_total_vol = base_df['Vol'].sum()
+                        final_show['体积占比'] = (final_show['Vol'] / current_total_vol * 100) if current_total_vol > 0 else 0
+
+                        # 定义列序和重命名
+                        if show_agg:
+                            base_cols = ['SKU', '分布情况', 'Qty', 'Vol', 'Fee', 'Age', '体积占比']
+                            rename_map = {'Qty':'库存(基准)', 'Vol':'体积(基准)', 'Fee':'费用(基准)', 'Age':'库龄(基准)'}
+                        else:
+                            base_cols = ['SKU', 'Warehouse', 'Qty', 'Vol', 'Fee', 'Age', '体积占比']
+                            rename_map = {'Qty':'库存(基准)', 'Vol':'体积(基准)', 'Fee':'费用(基准)', 'Age':'库龄(基准)'}
+                        
+                        cols_order = base_cols.copy()
+                        
+                        if is_tracking:
+                            # 插入追踪列：按逻辑分组 Qty -> Vol -> Fee -> Age
+                            cols_order.extend(['Qty_下月', '库存变化', 'Vol_下月', '体积变化', 'Fee_下月', '费用变化', 'Age_下月', '库龄增量'])
+                            rename_map.update({
+                                'Qty_下月': f'库存({target_month})', 
+                                'Vol_下月': f'体积({target_month})',
+                                'Fee_下月': f'费用({target_month})',
+                                'Age_下月': f'库龄({target_month})'
+                            })
+
+                        display_df = final_show[cols_order].rename(columns=rename_map)
+
+                        # 4. 样式渲染
+                        st.write(f"📊 **TOP 50 SKU 深度分析** {'(含 ' + target_month + ' 追踪数据)' if is_tracking else ''}")
+                        
+                        def style_tracking(styler):
+                            fmt_dict = {
+                                '费用(基准)': '${:.2f}', '体积(基准)': '{:.2f}', '库龄(基准)': '{:.0f}', '体积占比': '{:.1f}%',
+                                '库存(基准)': '{:.0f}'
+                            }
+                            if is_tracking:
+                                next_qty_col = f'库存({target_month})'
+                                next_vol_col = f'体积({target_month})'
+                                next_fee_col = f'费用({target_month})'
+                                next_age_col = f'库龄({target_month})'
+                                
+                                fmt_dict.update({
+                                    next_qty_col: '{:.0f}', '库存变化': '{:.0f}',
+                                    next_vol_col: '{:.2f}', '体积变化': '{:.2f}',
+                                    next_fee_col: '${:.2f}', '费用变化': '${:.2f}',
+                                    next_age_col: '{:.0f}', '库龄增量': '{:.0f}'
+                                })
+                            
+                            styler = styler.format(fmt_dict)
+                            # 基准费用色阶
+                            styler = styler.background_gradient(subset=['费用(基准)'], cmap='Reds')
+
+                            if is_tracking:
+                                # 变化列的高亮逻辑
+                                def highlight_good_bad(v):
+                                    if v < 0: return 'color: green; font-weight: bold' # 变少(好)
+                                    if v > 0: return 'color: red'   # 变多(坏)
+                                    return 'color: lightgray'
+
+                                def highlight_fee_diff(v):
+                                    if v < 0: return 'background-color: #e6ffe6; color: green' # 省钱了
+                                    if v > 0: return 'background-color: #ffe6e6; color: red'   # 多花钱了
+                                    return ''
+
+                                styler = styler.applymap(highlight_good_bad, subset=['库存变化', '体积变化'])
+                                styler = styler.applymap(highlight_fee_diff, subset=['费用变化'])
+                            
+                            return styler
+
+                        st.dataframe(
+                            style_tracking(display_df.style),
+                            use_container_width=True,
+                            height=600
+                        )
+
                 else:
+                    st.warning("该筛选条件下无数据")
+        
+        except Exception as e:
+            st.error(f"⚠️ 界面渲染发生错误: {str(e)}")
+
+    # ================= TAB 2: 趋势对比 (保持稳定) =================
+    with tab2:
+        try:
+            st.markdown("#### 🆚 历史趋势 & 风险洞察")
+            
+            cc1, cc2, cc3 = st.columns(3)
+            all_depts_t = sorted(full_df['Dept'].unique().tolist())
+            all_depts_t.insert(0, "全部汇总")
+            with cc1: t_dept = st.selectbox("分析部门", all_depts_t, key='t2_d')
+            df_t1 = full_df if t_dept == "全部汇总" else full_df[full_df['Dept'] == t_dept]
+
+            all_provs_t = sorted(df_t1['Provider'].unique().tolist())
+            all_provs_t.insert(0, "全部汇总")
+            with cc2: t_prov = st.selectbox("分析服务商", all_provs_t, key='t2_p')
+            df_t2 = df_t1 if t_prov == "全部汇总" else df_t1[df_t1['Provider'] == t_prov]
+
+            all_whs_t = sorted(df_t2['Warehouse'].unique().tolist())
+            with cc3: 
+                t_whs = st.multiselect("分析仓库 (可多选)", all_whs_t, default=all_whs_t, key='t2_w')
+            
+            if not t_whs:
+                st.warning("请至少选择一个仓库")
+                t_final = pd.DataFrame()
+            else:
+                t_final = df_t2[df_t2['Warehouse'].isin(t_whs)]
+            
+            if not t_final.empty:
+                avail_dates = sorted(t_final['Date'].unique())
+                selected_dates = st.multiselect("选择分析月份", avail_dates, default=avail_dates)
+                
+                if len(selected_dates) > 0:
+                    chart_df = t_final[t_final['Date'].isin(selected_dates)]
+                    
                     st.divider()
                     
-                    # 结果卡片增加 SKU 展示
-                    st.success(f"📦 **包含货品**: {res['包含SKU']}")
+                    # 柱状图：Vol + 标签
+                    agg_df = chart_df.groupby(['Date', 'Age_Range']).agg({
+                        'Qty': 'sum', 'Fee': 'sum', 'Vol': 'sum'
+                    }).reset_index()
                     
-                    c_a, c_b, c_c = st.columns(3)
-                    with c_a: st.metric("💰 预估总运费", f"${res['总费用']}")
-                    with c_b: st.metric("⚖️ 最终计费重", f"{res['计费重']} lbs")
-                    with c_c: st.metric("📦 有效包裹", f"{res['包裹数']} 件")
+                    st.markdown("##### 📦 各库龄段库存体积 (Vol) 对比")
                     
-                    st.table(pd.DataFrame({
-                        "费用项": ["基础运费", "燃油费", "偏远费", "超尺费"],
-                        "金额": [res['基础运费'], res['燃油费'], res['偏远费'], res['超尺费']]
-                    }).T)
+                    base_bar = alt.Chart(agg_df).encode(
+                        x=alt.X('Age_Range', sort=AGE_LABELS, title="库龄分段"),
+                        y=alt.Y('Vol', title="库存体积 (m³)"),
+                        color=alt.Color('Date', title="月份"),
+                        tooltip=['Date', 'Age_Range', 'Vol', 'Qty']
+                    )
+                    
+                    bars = base_bar.mark_bar().encode(xOffset='Date')
+                    
+                    text = base_bar.mark_text(
+                        align='center', baseline='bottom', dy=-5
+                    ).encode(
+                        xOffset='Date', text=alt.Text('Vol', format='.1f')
+                    )
+                    
+                    st.altair_chart((bars + text).properties(height=400), use_container_width=True)
+                    
+                    # 折线图：单位成本 + 标签
+                    st.divider()
+                    st.markdown("##### 📉 单位仓租成本趋势 (Fee / Qty)")
+                    
+                    cpu_trend = chart_df.groupby('Date').apply(
+                        lambda x: pd.Series({'CPU': x['Fee'].sum() / x['Qty'].sum() if x['Qty'].sum() > 0 else 0})
+                    ).reset_index()
+                    
+                    base_line = alt.Chart(cpu_trend).encode(
+                        x=alt.X('Date', title="月份"),
+                        y=alt.Y('CPU', title='单件成本 ($)'),
+                        tooltip=['Date', alt.Tooltip('CPU', format='.3f')]
+                    )
+                    
+                    line = base_line.mark_line(point=True)
+                    line_text = base_line.mark_text(align='left', dx=5, dy=-5).encode(text=alt.Text('CPU', format='.3f'))
 
-    # --- TAB 2: 批量上传 (保持不变) ---
-    with tab2:
-        st.markdown("### 📥 批量极速计算")
-        with st.expander("查看仓库对照表"):
-            st.dataframe(pd.DataFrame(WAREHOUSE_DB)[['name','zip']], hide_index=True)
+                    st.altair_chart((line + line_text).properties(height=350), use_container_width=True)
 
-        # 批量模板也顺便加个 SKU 列，万一他们想备注
-        template_df = pd.DataFrame(columns=["订单号", "常用SKU标记", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"])
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            template_df.to_excel(writer, index=False)
-        st.download_button("📄 下载模板 (含SKU列)", buffer.getvalue(), "LTL_Template_V4.9.xlsx")
-        
-        st.divider()
-        uploaded_file = st.file_uploader("上传 Excel", type=['xlsx'])
-        if uploaded_file:
-            try:
-                df_input = pd.read_excel(uploaded_file, engine='openpyxl')
-                # 兼容旧模板，不强制要求 SKU 列
-                required = ["订单号", "发货邮编", "收货邮编", "收货州", "长", "宽", "高", "实重"]
-                if not all(c in df_input.columns for c in required):
-                    st.error("❌ 格式错误")
-                else:
-                    grouped = df_input.groupby('订单号')
-                    results = []
-                    bar = st.progress(0)
-                    for i, (order_id, group_df) in enumerate(grouped):
-                        res, err = calculate_shipment_fast(zone_dict, rate_dict, remote_zips, group_df)
-                        row_res = {'订单号': order_id}
-                        if err:
-                            row_res['状态'] = '失败'
-                            row_res['错误信息'] = err
+                    # 恶化监控
+                    st.divider()
+                    st.markdown("#### 🚨 恶化监控")
+                    if len(selected_dates) >= 2:
+                        sorted_dates = sorted(selected_dates)
+                        curr, prev = sorted_dates[-1], sorted_dates[-2]
+                        group_cols = ['SKU', 'Warehouse', 'Dept', 'Provider']
+                        
+                        df_c = chart_df[chart_df['Date'] == curr][group_cols + ['Age_Range', 'Fee']]
+                        df_p = chart_df[chart_df['Date'] == prev][group_cols + ['Age_Range']]
+                        
+                        merged = pd.merge(df_p, df_c, on=group_cols, suffixes=('_old', '_new'))
+                        merged['i_old'] = merged['Age_Range_old'].map(AGE_MAP).fillna(-1)
+                        merged['i_new'] = merged['Age_Range_new'].map(AGE_MAP).fillna(-1)
+                        
+                        bad = merged[merged['i_new'] > merged['i_old']].copy()
+                        if bad.empty:
+                            st.success("🎉 无恶化")
                         else:
-                            row_res['状态'] = '成功'
-                            row_res.update(res)
-                        results.append(row_res)
-                        bar.progress((i + 1) / len(grouped))
-                    
-                    res_df = pd.DataFrame(results)
-                    st.success(f"🎉 {len(res_df)} 个订单计算完成！")
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        res_df.to_excel(writer, index=False)
-                    st.download_button("📥 下载结果", output.getvalue(), "LTL_Fast_Result.xlsx", type="primary")
-            except Exception as e:
-                st.error(f"❌: {e}")
+                            bad['Fee'] = bad['Fee'].astype(float)
+                            show = bad.sort_values('Fee', ascending=False).head(20)
+                            st.dataframe(show[['SKU', 'Dept', 'Warehouse', 'Age_Range_old', 'Age_Range_new', 'Fee']].style.format({'Fee':'${:.2f}'}).background_gradient(subset=['Fee'], cmap='Reds'), use_container_width=True)
+                else:
+                    st.info("请至少选择一个月份")
+        except Exception as e:
+            st.error(f"趋势图表渲染错误: {str(e)}")
