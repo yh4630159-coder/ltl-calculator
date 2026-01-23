@@ -152,7 +152,7 @@ else:
 
     # --- TAB 1: 交互式 ---
     with tab1:
-        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。删除不用的条目使用DELTE键哈")
+        st.info("💡 提示：【常用SKU标记】列仅供备注，不影响计算。删除不用的条目使用DELTE键哈！计算单位一定要换算好！")
         
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -266,3 +266,4 @@ else:
             except Exception as e:
 
                 st.error(f"❌: {e}")
+
